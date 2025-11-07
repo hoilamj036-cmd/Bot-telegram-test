@@ -1,3 +1,2 @@
 python-telegram-bot==20.7
-httpx[http2]<0.28
-certifi
+requests
