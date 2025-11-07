@@ -1,11 +1,11 @@
-# --- TOKEN (bạn sẽ đổi sau khi test xong) ---
+# --- TOKEN (đang hardcode để bạn test; nhớ đổi sau) ---
 BOT_TOKEN = "8412177639:AAHvzw4Ny8LlBE2P9gl3vZ-o6Jbv9TtU6DQ"
 
 import re, unicodedata, asyncio
 from datetime import datetime, timedelta
 from collections import defaultdict
-import httpx
 from urllib.parse import quote
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
@@ -14,57 +14,88 @@ from telegram.request import HTTPXRequest
 TURN_TIMEOUT_SECONDS = 25
 IGNORE_DIACRITICS = True
 MAP_D_TO_D = True
-CHECK_ALL_TOKENS = False   # <<< CHỈ kiểm tra từ ĐẦU & CUỐI
-HTTP2 = False              # Railway khỏi cần gói h2
+HTTP2 = False              # dùng HTTP/1.1 cho gọn trên Railway
+CHECK_ALL_TOKENS = False  # kiểm tra từ đầu & cuối (hợp lệ cho nối CỤM TỪ)
 
-# ===== Tiện ích tiếng Việt =====
-def strip(s):
+# ===== Tiện ích TV =====
+def strip(s: str) -> str:
     s = s.replace("Đ","D").replace("đ","d") if MAP_D_TO_D else s
     nf = unicodedata.normalize("NFD", s)
-    return "".join(ch for ch in nf if unicodedata.category(ch)!="Mn")
+    return "".join(ch for ch in nf if unicodedata.category(ch) != "Mn")
 
-def norm_token(t):
+def norm_token(t: str) -> str:
     t = re.sub(r"[^\w\u00C0-\u024F\u1E00-\u1EFF]", "", t.lower())
     return strip(t) if IGNORE_DIACRITICS else t
 
-def toks(s):
+def toks(s: str):
     return re.findall(r"[0-9A-Za-z_\u00C0-\u024F\u1E00-\u1EFF]+", s)
 
-# ===== Kiểm tra từ online (có fallback) =====
-async def _exists_wiki(client, word: str) -> bool:
-    # 1) thử summary với từ nguyên bản
-    url1 = f"https://vi.wiktionary.org/api/rest_v1/page/summary/{quote(word)}"
-    r1 = await client.get(url1, timeout=6)
-    if r1.status_code == 200:
-        return True
-    # 2) thử opensearch (gần đúng)
-    url2 = "https://vi.wiktionary.org/w/api.php"
-    r2 = await client.get(url2, params={
-        "action": "opensearch",
-        "search": word,
-        "limit": 3,
-        "namespace": 0,
-        "format": "json",
-    }, timeout=6)
-    if r2.status_code == 200:
-        data = r2.json()
-        if isinstance(data, list) and len(data) > 1:
-            sugg = [s.strip().lower() for s in data[1]]
-            if word.strip().lower() in sugg:
-                return True
+# ===== Kiểm tra từ: đa nguồn (không bỏ qua "cái", "con", ...) =====
+async def wiki_summary_exists(c: httpx.AsyncClient, word: str) -> bool:
+    r = await c.get(f"https://vi.wiktionary.org/api/rest_v1/page/summary/{quote(word)}", timeout=6)
+    return r.status_code == 200
+
+async def wiki_html_exists(c: httpx.AsyncClient, word: str) -> bool:
+    # lấy trang HTML, theo redirect; 200 và có nội dung chính là ok
+    r = await c.get(f"https://vi.wiktionary.org/wiki/{quote(word)}", follow_redirects=True, timeout=6)
+    if r.status_code != 200:
+        return False
+    # một vài kiểm heuristics đơn giản
+    txt = r.text.lower()
+    return ("mw-content-text" in txt) or ("ns-0" in txt) or ("wiktionary" in txt)
+
+async def wiki_opensearch_match(c: httpx.AsyncClient, word: str) -> bool:
+    r = await c.get("https://vi.wiktionary.org/w/api.php",
+                    params={"action": "opensearch", "search": word, "limit": 5, "namespace": 0, "format": "json"},
+                    timeout=6)
+    if r.status_code != 200:
+        return False
+    data = r.json()
+    if isinstance(data, list) and len(data) > 1:
+        cands = [s.strip().lower() for s in data[1]]
+        w = word.strip().lower()
+        if w in cands:
+            return True
+        # gần đúng: hình thức không dấu khớp ứng viên
+        nd = strip(w)
+        return any(nd == strip(x) for x in cands)
     return False
 
-async def check_word(word: str) -> bool:
-    # Thử bản có dấu, rồi bản bỏ dấu
+async def wikipedia_opensearch_match(c: httpx.AsyncClient, word: str) -> bool:
+    r = await c.get("https://vi.wikipedia.org/w/api.php",
+                    params={"action": "opensearch", "search": word, "limit": 5, "namespace": 0, "format": "json"},
+                    timeout=6)
+    if r.status_code != 200:
+        return False
+    data = r.json()
+    if isinstance(data, list) and len(data) > 1:
+        cands = [s.strip().lower() for s in data[1]]
+        w = word.strip().lower()
+        if w in cands:
+            return True
+        nd = strip(w)
+        return any(nd == strip(x) for x in cands)
+    return False
+
+async def check_word_strict(word: str) -> bool:
+    # kiểm tra theo chuỗi fallback mạnh
     async with httpx.AsyncClient(http2=HTTP2) as c:
         try:
-            if await _exists_wiki(c, word):
-                return True
+            if await wiki_summary_exists(c, word): return True
+            if await wiki_html_exists(c, word):    return True
+            if await wiki_opensearch_match(c, word): return True
+            # bản không dấu
             nd = strip(word.lower())
             if nd != word.lower():
-                return await _exists_wiki(c, nd)
+                if await wiki_summary_exists(c, nd): return True
+                if await wiki_html_exists(c, nd):    return True
+                if await wiki_opensearch_match(c, nd): return True
+            # fallback cuối: Wikipedia có entry/từ vựng thông dụng
+            if await wikipedia_opensearch_match(c, word): return True
+            if nd != word.lower() and await wikipedia_opensearch_match(c, nd): return True
         except Exception:
-            return True  # đừng làm game dừng vì lỗi mạng -> tạm cho qua
+            # nếu mạng lỗi: cho qua để không chặn cuộc chơi
+            return True
     return False
 
 async def valid(phrase: str):
@@ -73,12 +104,12 @@ async def valid(phrase: str):
         return False, "Cụm không hợp lệ."
     to_check = ts if CHECK_ALL_TOKENS else [ts[0], ts[-1]]
     for w in to_check:
-        ok = await check_word(w)
+        ok = await check_word_strict(w)
         if not ok:
-            return False, f"❌ Từ “{w}” không có trên Wiktionary."
+            return False, f"❌ Từ “{w}” không có trong từ điển."
     return True, ""
 
-# ===== Trạng thái game =====
+# ===== Game state =====
 class Game:
     def __init__(self):
         self.on=False
@@ -96,9 +127,7 @@ def g(cid):
 # ===== Handlers =====
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "🎮 /startgame [cụm] để bắt đầu\n"
-        "/score để xem điểm\n"
-        "/stopgame để kết thúc"
+        "🎮 /startgame [cụm] để bắt đầu\n/score để xem điểm\n/stopgame để kết thúc"
     )
 
 async def cmd_startgame(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -111,13 +140,13 @@ async def cmd_startgame(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text=" ".join(c.args) if c.args else ""
     if text:
         ok,err=await valid(text)
-        if not ok: 
+        if not ok:
             gm.on=False
             return await u.message.reply_text(err)
         gm.used.add(text.lower())
         last = toks(text)[-1]
-        gm.need_disp = last                 # hiển thị có dấu
-        gm.need_norm = norm_token(last)     # so khớp bỏ dấu
+        gm.need_disp = last
+        gm.need_norm = norm_token(last)
         gm.deadline = datetime.utcnow() + timedelta(seconds=TURN_TIMEOUT_SECONDS)
         await u.message.reply_text(
             f"✅ Bắt đầu: {text}\n➡️ Nối từ bắt đầu bằng **{gm.need_disp.upper()}**",
