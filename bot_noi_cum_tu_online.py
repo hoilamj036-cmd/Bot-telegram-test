@@ -1,241 +1,228 @@
-#!/usr/bin/env python3
 import logging
-import requests
 import random
+import requests
 import unicodedata
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
 
-from telegram import Update, ParseMode
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-
-# Kích hoạt ghi log
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
+# Cấu hình logging
+logging.basicConfig(
+    format='%(asctime)s – %(name)s – %(levelname)s – %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-TOKEN = "8412177639:AAHvzw4Ny8LlBE2P9gl3vZ-o6Jbv9TtU6DQ"  # Thay bằng token của bạn
+# Token bot (test)
+BOT_TOKEN = "8412177639:AAHvzw4Ny8LlBE2P9gl3vZ-o6Jbv9TtU6DQ"
 
-def unaccent(text):
-    """Loại bỏ dấu tiếng Việt để so sánh ký tự."""
-    nkfd_form = unicodedata.normalize('NFD', text)
-    return ''.join([c for c in nkfd_form if not unicodedata.category(c).startswith('M')])
+# Hàm chuẩn hóa bỏ dấu cho việc nối từ
+def strip_accents(s: str) -> str:
+    s_nf = unicodedata.normalize('NFD', s)
+    return ''.join(ch for ch in s_nf if unicodedata.category(ch) != 'Mn')
 
-def is_valid_word(word):
-    """
-    Kiểm tra từ trong Wiktionary tiếng Việt.
-    Sử dụng MediaWiki API: nếu trang bài viết tồn tại thì coi như có nghĩa.
-    """
+def normalized_first_char(s: str) -> str:
+    if not s:
+        return ''
+    s_stripped = strip_accents(s.strip().lower())
+    return s_stripped[0]
+
+def normalized_last_char(s: str) -> str:
+    if not s:
+        return ''
+    t = s.strip()
+    # lấy ký tự cuối cùng là chữ cái
+    i = len(t)-1
+    while i >= 0 and not t[i].isalpha():
+        i -= 1
+    if i < 0:
+        return ''
+    ch = t[i]
+    return strip_accents(ch.lower())
+
+# Kiểm tra cụm từ có tồn tại (sử dụng Wiktionary tiếng Việt)
+def word_exists_vi(word: str) -> bool:
     try:
         url = "https://vi.wiktionary.org/w/api.php"
-        params = {"action": "query", "titles": word, "format": "json"}
-        res = requests.get(url, params=params, timeout=5)
-        res.raise_for_status()
-        data = res.json()
+        params = {
+            "action": "query",
+            "titles": word,
+            "format": "json"
+        }
+        r = requests.get(url, params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
         pages = data.get("query", {}).get("pages", {})
-        for page_id, page in pages.items():
+        for pid, page in pages.items():
             if 'missing' not in page:
-                return True  # Trang có tồn tại
+                return True
         return False
     except Exception as e:
         logger.error(f"Error checking word {word}: {e}")
         return False
 
+# Lưu trạng thái trò chơi theo chat_id
 class Game:
     def __init__(self):
-        self.players = []         # Danh sách người chơi (lưu user object)
-        self.current_phrase = None
-        self.current_index = 0    # Chỉ số người chơi hiện tại trong vòng chơi
-        self.join_job = None      # Job đếm giờ 30s chờ join
-        self.turn_job = None      # Job đếm giờ 30s cho lượt
-        self.game_active = False  # Cờ đang chơi
-        self.waiting_for = None   # user_id người chơi đang chờ trả lời
+        self.active = False
+        self.join_phase = False
+        self.players = []           # danh sách user objects
+        self.current_phrase = None  # cụm từ hiện tại
+        self.turn_index = 0
+        self.job_join = None        # job chờ join
+        self.job_turn = None        # job chờ lượt
 
-games = {}  # Lưu trạng thái game theo chat_id
+games = {}
 
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Chào! Dùng /Batdau để bắt đầu trò chơi nối từ.")
-
-def batdau(update: Update, context: CallbackContext):
+# Lệnh /Batdau
+async def cmd_batdau(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if chat_id in games and games[chat_id].game_active:
-        update.message.reply_text("Đã có trò chơi đang diễn ra.")
+    if chat_id in games and games[chat_id].active:
+        await update.message.reply_text("Trò chơi đã đang diễn ra.")
         return
     game = Game()
+    game.active = True
+    game.join_phase = True
     games[chat_id] = game
-    update.message.reply_text("Trò chơi nối từ sẽ bắt đầu sau 30 giây! Dùng /join để tham gia.")
-    # Lập lịch bắt đầu trò chơi sau 30 giây
-    game.join_job = context.job_queue.run_once(start_game, 30, context=chat_id)
+    await update.message.reply_text("Trò chơi nối từ sẽ bắt đầu! Gõ /join để tham gia trong 30 giây.")
+    # sau 30s kết thúc giai đoạn join
+    game.job_join = context.job_queue.run_once(end_join_phase, when=30, chat_id=chat_id)
 
-def join(update: Update, context: CallbackContext):
+# Lệnh /join
+async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-    if chat_id not in games:
-        update.message.reply_text("Trò chơi chưa bắt đầu. Dùng /Batdau để bắt đầu.")
+    if chat_id not in games or not games[chat_id].active:
+        await update.message.reply_text("Hiện không có trò chơi nào. Dùng /Batdau để bắt đầu.")
         return
     game = games[chat_id]
-    if game.game_active:
-        update.message.reply_text("Trò chơi đã bắt đầu, không thể tham gia nữa.")
+    if not game.join_phase:
+        await update.message.reply_text("Đã hết thời gian tham gia.")
         return
+    # kiểm tra xem user đã tham gia chưa
     if any(p.id == user.id for p in game.players):
-        update.message.reply_text("Bạn đã tham gia rồi!")
+        await update.message.reply_text(f"{user.full_name} đã tham gia rồi.")
         return
     game.players.append(user)
-    update.message.reply_text(f"{user.first_name} đã tham gia trò chơi!")
+    await update.message.reply_text(f"{user.full_name} tham gia trò chơi!")
 
-def start_game(context: CallbackContext):
-    chat_id = context.job.context
-    game = games.get(chat_id)
-    if not game:
+async def end_join_phase(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    if chat_id not in games:
         return
-    players = game.players
-    if len(players) < 2:
-        context.bot.send_message(chat_id, "Không đủ người chơi để bắt đầu. Trò chơi kết thúc.")
-        games.pop(chat_id, None)
+    game = games[chat_id]
+    if not game.active or not game.join_phase:
         return
-    # Lấy cụm từ đầu tiên ngẫu nhiên từ Wiktionary (random page)
-    try:
-        res = requests.get("https://vi.wiktionary.org/w/api.php", params={
-            "action": "query", "list": "random", "rnnamespace": "0",
-            "rnlimit": "1", "format": "json"
-        }, timeout=5)
-        data = res.json()
-        rand_page = data.get("query", {}).get("random", [{}])[0].get("title", "xin chào")
-    except Exception as e:
-        logger.error(f"Error getting random word: {e}")
-        rand_page = "xin chào"
-    game.current_phrase = rand_page
-    game.game_active = True
-    context.bot.send_message(chat_id,
-                             f"Trò chơi bắt đầu! Cụm từ đầu tiên: *{game.current_phrase}*",
-                             parse_mode=ParseMode.MARKDOWN)
-    # Bắt đầu lượt đầu tiên
-    game.current_index = 0
-    prompt_next_turn(context, chat_id)
+    game.join_phase = False
+    if len(game.players) < 2:
+        await context.bot.send_message(chat_id, "Không đủ người chơi để bắt đầu. Trò chơi kết thúc.")
+        del games[chat_id]
+        return
+    # chọn cụm từ đầu tiên ngẫu nhiên (ví dụ dùng từ Wiktionary random hoặc cố định mẫu)
+    # Ở đây ta dùng mẫu tĩnh đơn giản:
+    starters = ["cái bàn", "con mèo", "chiếc ghế", "quả táo", "đồ vật"]
+    phrase = random.choice(starters)
+    game.current_phrase = phrase
+    await context.bot.send_message(chat_id, f"🎮 Trò chơi bắt đầu! Cụm từ đầu tiên: *{phrase}*", parse_mode="Markdown")
+    # bắt đầu lượt đầu tiên
+    game.turn_index = 0
+    await prompt_next_player(context, chat_id)
 
-def prompt_next_turn(context: CallbackContext, chat_id):
-    game = games.get(chat_id)
-    if not game or not game.game_active:
+async def prompt_next_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    if chat_id not in games:
         return
-    # Nếu chỉ còn 1 người thì họ thắng
+    game = games[chat_id]
+    # nếu chỉ còn 1 người → thắng
     if len(game.players) == 1:
         winner = game.players[0]
-        mention = f"@{winner.username}" if winner.username else winner.first_name
-        context.bot.send_message(chat_id, f"Chúc mừng {mention}! Bạn đã chiến thắng!")
-        games.pop(chat_id, None)
+        mention = f"@{winner.username}" if winner.username else winner.full_name
+        await context.bot.send_message(chat_id, f"🏆 Chúc mừng {mention}! Bạn đã chiến thắng!")
+        del games[chat_id]
         return
-    game.current_index %= len(game.players)
-    player = game.players[game.current_index]
-    mention = f"@{player.username}" if player.username else player.first_name
-    context.bot.send_message(chat_id, f"{mention}, đến lượt bạn! Nhập cụm từ tiếp theo...")
-    game.waiting_for = player.id
-    # Lập lịch timeout sau 30 giây cho lượt này
-    game.turn_job = context.job_queue.run_once(turn_timeout, 30, context=chat_id)
+    # xác định người kế tiếp
+    game.turn_index %= len(game.players)
+    player = game.players[game.turn_index]
+    mention = f"@{player.username}" if player.username else player.full_name
+    await context.bot.send_message(chat_id, f"{mention}, lượt của bạn! Hãy nhập cụm từ tiếp theo bắt đầu bằng *{normalized_last_char(game.current_phrase).upper()}*.", parse_mode="Markdown")
+    # đặt job timeout 30s
+    game.job_turn = context.job_queue.run_once(on_turn_timeout, when=30, chat_id=chat_id)
 
-def turn_timeout(context: CallbackContext):
-    chat_id = context.job.context
-    game = games.get(chat_id)
-    if not game or not game.game_active:
+async def on_turn_timeout(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    if chat_id not in games:
         return
-    if game.current_index < len(game.players):
-        timed_out_player = game.players[game.current_index]
-    else:
-        return
-    mention = f"@{timed_out_player.username}" if timed_out_player.username else timed_out_player.first_name
-    context.bot.send_message(chat_id, f"{mention} đã hết thời gian và bị loại.")
-    game.players.pop(game.current_index)
-    # Kiểm tra kết thúc
-    if len(game.players) <= 1:
-        if game.players:
-            winner = game.players[0]
-            mention = f"@{winner.username}" if winner.username else winner.first_name
-            context.bot.send_message(chat_id, f"Chúc mừng {mention}! Bạn đã chiến thắng.")
-        else:
-            context.bot.send_message(chat_id, "Không còn người chơi nào. Trò chơi kết thúc.")
-        games.pop(chat_id, None)
-        return
-    prompt_next_turn(context, chat_id)
+    game = games[chat_id]
+    # user thiệt hại lượt này
+    if game.turn_index < len(game.players):
+        eliminated = game.players.pop(game.turn_index)
+        mention = f"@{eliminated.username}" if eliminated.username else eliminated.full_name
+        await context.bot.send_message(chat_id, f"{mention} đã hết thời gian và bị loại.")
+    # kiểm tra kết thúc
+    await prompt_next_player(context, chat_id)
 
-def message_handler(update: Update, context: CallbackContext):
+# Xử lý tin nhắn (cụm từ người chơi gõ)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
     text = update.message.text.strip()
     if chat_id not in games:
         return
     game = games[chat_id]
-    if not game.game_active:
+    if not game.active or game.join_phase:
         return
-    # Chỉ xử lý nếu đúng người được nhắc trả lời
-    if user.id != game.waiting_for:
+    # kiểm xem có đúng người được nhắc
+    if game.players and game.players[game.turn_index].id != user.id:
         return
-    # Hủy bỏ công việc timeout nếu có
-    if game.turn_job:
-        game.turn_job.schedule_removal()
-        game.turn_job = None
-    phrase = text
-    # Lấy chữ cái cuối của cụm từ hiện tại (đã loại bỏ ký tự không phải chữ)
-    last_char = game.current_phrase.strip()[-1]
-    while last_char and not last_char.isalpha():
-        game.current_phrase = game.current_phrase[:-1]
-        last_char = game.current_phrase.strip()[-1] if game.current_phrase else ''
-    first_char = phrase.strip()[0] if phrase else ''
-    if first_char:
-        first_norm = unaccent(first_char.lower())
-        last_norm = unaccent(last_char.lower()) if last_char else ''
-    else:
-        first_norm = ''
-        last_norm = ''
-    valid_chain = (first_norm == last_norm and first_char != '')
-    # Kiểm tra từng từ trong cụm có trong từ điển không
-    valid_phrase = True
-    for word in phrase.split():
-        if not is_valid_word(word):
-            valid_phrase = False
-            break
-    if not valid_chain or not valid_phrase:
-        mention = f"@{user.username}" if user.username else user.first_name
-        update.message.reply_text(f"{mention} đã bị loại vì cụm từ không hợp lệ.")
-        # Loại người chơi
-        for i, p in enumerate(game.players):
-            if p.id == user.id:
-                game.players.pop(i)
-                break
-        game.current_index %= len(game.players) if game.players else 0
-        if len(game.players) <= 1:
-            if game.players:
-                winner = game.players[0]
-                mention_win = f"@{winner.username}" if winner.username else winner.first_name
-                update.message.reply_text(f"Chúc mừng {mention_win}! Bạn đã chiến thắng.")
-            else:
-                update.message.reply_text("Không còn người chơi nào. Trò chơi kết thúc.")
-            games.pop(chat_id, None)
-        else:
-            prompt_next_turn(context, chat_id)
+    # hủy job timeout của lượt này
+    if game.job_turn:
+        game.job_turn.schedule_removal()
+        game.job_turn = None
+    # kiểm nối từ
+    last_char = normalized_last_char(game.current_phrase)
+    first_char = normalized_first_char(text)
+    if first_char != last_char:
+        mention = f"@{user.username}" if user.username else user.full_name
+        await update.message.reply_text(f"{mention} gõ sai chữ nối. Bị loại.")
+        # loại người chơi
+        game.players.pop(game.turn_index)
+        # kiểm kết thúc
+        await prompt_next_player(context, chat_id)
         return
-    # Nếu hợp lệ, cập nhật và chuyển lượt
-    game.current_phrase = phrase
-    update.message.reply_text("Cụm từ hợp lệ! Tiếp tục nào...")
-    game.current_index = (game.current_index + 1) % len(game.players)
-    prompt_next_turn(context, chat_id)
+    # kiểm tra cụm có nghĩa
+    # kiểm mỗi từ trong cụm
+    words = text.split()
+    for w in words:
+        if not word_exists_vi(w):
+            mention = f"@{user.username}" if user.username else user.full_name
+            await update.message.reply_text(f"{mention} sử dụng từ \"{w}\" không có trong từ điển. Bị loại.")
+            game.players.pop(game.turn_index)
+            await prompt_next_player(context, chat_id)
+            return
+    # nếu hợp lệ
+    game.current_phrase = text
+    await update.message.reply_text(f"Cụm từ \"{text}\" hợp lệ!")
+    # chuyển lượt
+    game.turn_index += 1
+    await prompt_next_player(context, chat_id)
 
-def ketthuc(update: Update, context: CallbackContext):
+# Lệnh /Ketthuc
+async def cmd_ketthuc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in games:
-        games.pop(chat_id, None)
-        update.message.reply_text("Trò chơi đã được kết thúc.")
+        del games[chat_id]
+        await update.message.reply_text("Trò chơi đã được kết thúc.")
     else:
-        update.message.reply_text("Chưa có trò chơi nào đang diễn ra.")
+        await update.message.reply_text("Không có trò chơi nào đang diễn ra.")
 
 def main():
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("Batdau", batdau))
-    dp.add_handler(CommandHandler("join", join))
-    dp.add_handler(CommandHandler("Ketthuc", ketthuc))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, message_handler))
-
-    updater.start_polling()
-    updater.idle()
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("Batdau", cmd_batdau))
+    application.add_handler(CommandHandler("join", cmd_join))
+    application.add_handler(CommandHandler("Ketthuc", cmd_ketthuc))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.run_polling()
+    logger.info("Bot đã khởi động.")
 
 if __name__ == '__main__':
     main()
