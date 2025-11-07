@@ -30,74 +30,86 @@ def norm_token(t: str) -> str:
 def toks(s: str):
     return re.findall(r"[0-9A-Za-z_\u00C0-\u024F\u1E00-\u1EFF]+", s)
 
-# ===== Kiểm tra từ: đa nguồn (không bỏ qua "cái", "con", ...) =====
-async def wiki_summary_exists(c: httpx.AsyncClient, word: str) -> bool:
-    r = await c.get(f"https://vi.wiktionary.org/api/rest_v1/page/summary/{quote(word)}", timeout=6)
+# ===== Kiểm tra từ: đa nguồn (Soha/VDict/Wiktionary/Wikipedia) =====
+from urllib.parse import quote
+
+async def soha_exists(c, word: str) -> bool:
+    # Soha: /dict/vn_vn/<từ>; 200 + có vùng kết quả
+    r = await c.get(f"https://tratu.soha.vn/dict/vn_vn/{quote(word)}",
+                    follow_redirects=True, timeout=8)
+    if r.status_code != 200:
+        return False
+    t = r.text.lower()
+    # heuristics: có khối kết quả & không có "không tìm thấy"
+    return ("class=\"result\"" in t) or ("kết quả" in t and "không tìm thấy" not in t)
+
+async def vdict_exists(c, word: str) -> bool:
+    # VDict: /<từ>,1,0,0.html
+    r = await c.get(f"https://vdict.com/{quote(word)},1,0,0.html",
+                    follow_redirects=True, timeout=8)
+    if r.status_code != 200:
+        return False
+    t = r.text.lower()
+    return ("vdict" in t) and ("không tìm thấy" not in t)
+
+async def wiki_summary_exists(c, word: str) -> bool:
+    r = await c.get(f"https://vi.wiktionary.org/api/rest_v1/page/summary/{quote(word)}",
+                    timeout=6)
     return r.status_code == 200
 
-async def wiki_html_exists(c: httpx.AsyncClient, word: str) -> bool:
-    # lấy trang HTML, theo redirect; 200 và có nội dung chính là ok
-    r = await c.get(f"https://vi.wiktionary.org/wiki/{quote(word)}", follow_redirects=True, timeout=6)
+async def wiki_html_exists(c, word: str) -> bool:
+    r = await c.get(f"https://vi.wiktionary.org/wiki/{quote(word)}",
+                    follow_redirects=True, timeout=8)
     if r.status_code != 200:
         return False
-    # một vài kiểm heuristics đơn giản
-    txt = r.text.lower()
-    return ("mw-content-text" in txt) or ("ns-0" in txt) or ("wiktionary" in txt)
+    t = r.text.lower()
+    return ("mw-content-text" in t) and ("search" not in r.url.path.lower())
 
-async def wiki_opensearch_match(c: httpx.AsyncClient, word: str) -> bool:
+async def wiki_opensearch_match(c, word: str) -> bool:
     r = await c.get("https://vi.wiktionary.org/w/api.php",
-                    params={"action": "opensearch", "search": word, "limit": 5, "namespace": 0, "format": "json"},
+                    params={"action":"opensearch","search":word,"limit":5,"namespace":0,"format":"json"},
                     timeout=6)
-    if r.status_code != 200:
-        return False
+    if r.status_code != 200: return False
     data = r.json()
     if isinstance(data, list) and len(data) > 1:
         cands = [s.strip().lower() for s in data[1]]
-        w = word.strip().lower()
-        if w in cands:
-            return True
-        # gần đúng: hình thức không dấu khớp ứng viên
-        nd = strip(w)
-        return any(nd == strip(x) for x in cands)
+        w = word.strip().lower(); nd = strip(w)
+        return (w in cands) or any(strip(x)==nd for x in cands)
     return False
 
-async def wikipedia_opensearch_match(c: httpx.AsyncClient, word: str) -> bool:
+async def wikipedia_opensearch_match(c, word: str) -> bool:
     r = await c.get("https://vi.wikipedia.org/w/api.php",
-                    params={"action": "opensearch", "search": word, "limit": 5, "namespace": 0, "format": "json"},
+                    params={"action":"opensearch","search":word,"limit":5,"namespace":0,"format":"json"},
                     timeout=6)
-    if r.status_code != 200:
-        return False
+    if r.status_code != 200: return False
     data = r.json()
     if isinstance(data, list) and len(data) > 1:
         cands = [s.strip().lower() for s in data[1]]
-        w = word.strip().lower()
-        if w in cands:
-            return True
-        nd = strip(w)
-        return any(nd == strip(x) for x in cands)
+        w = word.strip().lower(); nd = strip(w)
+        return (w in cands) or any(strip(x)==nd for x in cands)
     return False
 
 async def check_word_strict(word: str) -> bool:
-    # kiểm tra theo chuỗi fallback mạnh
-    async with httpx.AsyncClient(http2=HTTP2) as c:
+    # Được chấp nhận nếu xuất hiện ở BẤT KỲ nguồn nào
+    async with httpx.AsyncClient() as c:
         try:
-            if await wiki_summary_exists(c, word): return True
-            if await wiki_html_exists(c, word):    return True
-            if await wiki_opensearch_match(c, word): return True
-            # bản không dấu
-            nd = strip(word.lower())
-            if nd != word.lower():
-                if await wiki_summary_exists(c, nd): return True
-                if await wiki_html_exists(c, nd):    return True
-                if await wiki_opensearch_match(c, nd): return True
-            # fallback cuối: Wikipedia có entry/từ vựng thông dụng
-            if await wikipedia_opensearch_match(c, word): return True
-            if nd != word.lower() and await wikipedia_opensearch_match(c, nd): return True
+            checks = [
+                soha_exists, vdict_exists,
+                wiki_summary_exists, wiki_html_exists, wiki_opensearch_match,
+                wikipedia_opensearch_match
+            ]
+            # 1) thử với chữ có dấu
+            for fn in checks:
+                if await fn(c, word): return True
+            # 2) thử bản KHÔNG DẤU
+            w2 = strip(word.lower())
+            if w2 != word.lower():
+                for fn in checks:
+                    if await fn(c, w2): return True
         except Exception:
-            # nếu mạng lỗi: cho qua để không chặn cuộc chơi
+            # Lỗi mạng → không chặn cuộc chơi
             return True
     return False
-
 async def valid(phrase: str):
     ts = toks(phrase)
     if not ts:
